@@ -17,7 +17,7 @@ mod _io {
 
     use bstr::ByteSlice;
     use crossbeam_utils::atomic::AtomicCell;
-    use num_traits::{NumCast, ToPrimitive};
+    use num_traits::ToPrimitive;
     use std::io::{self, prelude::*, Cursor, SeekFrom};
     use std::ops::Range;
 
@@ -625,6 +625,35 @@ mod _io {
             Ok(offset)
         }
 
+        fn seek(&mut self, target: Offset, whence: i32, vm: &VirtualMachine) -> PyResult<Offset> {
+            if matches!(whence, 0 | 1) && self.readable() {
+                let current = self.raw_tell_cache(vm)?;
+                let available = self.readahead();
+                if available > 0 {
+                    let offset = if whence == 0 {
+                        target - (current - self.raw_offset())
+                    } else {
+                        target
+                    };
+                    if offset >= -self.pos && offset <= available {
+                        self.pos += offset;
+                        return Ok(current - available + offset);
+                    }
+                }
+            }
+            // vm.invoke(&vm.get_attribute(raw, "seek")?, args)
+            if self.writable() {
+                self.flush(vm)?;
+            }
+            let target = if whence == 1 { -target } else { target };
+            let n = self.raw_seek(target, whence, vm)?;
+            self.raw_pos = -1;
+            if self.readable() {
+                self.reset_read();
+            }
+            Ok(n)
+        }
+
         fn raw_tell(&mut self, vm: &VirtualMachine) -> PyResult<Offset> {
             let ret = vm.call_method(self.check_init(vm)?, "seek", ())?;
             let offset = get_offset(ret, vm)?;
@@ -635,6 +664,14 @@ mod _io {
             }
             self.abs_pos = offset;
             Ok(offset)
+        }
+
+        fn raw_tell_cache(&mut self, vm: &VirtualMachine) -> PyResult<Offset> {
+            if self.abs_pos == -1 {
+                self.raw_tell(vm)
+            } else {
+                Ok(self.abs_pos)
+            }
         }
 
         /// None means non-blocking failed
@@ -931,9 +968,9 @@ mod _io {
     }
 
     fn get_offset(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<Offset> {
+        use std::convert::TryInto;
         let int = vm.to_index(&obj)?;
-        // TODO: patch num-traits to impl<T: ToPrimitive> ToPrimitive for &T
-        NumCast::from(int.borrow_value().clone()).ok_or_else(|| {
+        int.borrow_value().try_into().map_err(|_| {
             vm.new_value_error(format!(
                 "cannot fit '{}' into an offset-sized integer",
                 obj.class().name
@@ -999,21 +1036,24 @@ mod _io {
 
             Ok(())
         }
-
         #[pymethod]
         fn seek(
             &self,
-            pos: PyObjectRef,
+            target: PyObjectRef,
             whence: OptionalArg<i32>,
             vm: &VirtualMachine,
         ) -> PyResult<Offset> {
-            let pos = get_offset(pos, vm)?;
             let whence = whence.unwrap_or(0);
-            self.lock(vm)?.raw_seek(pos, whence, vm)
+            let mut data = self.lock(vm)?;
+            let raw = data.check_init(vm)?;
+            ensure_unclosed(raw, "seek of closed file", vm)?;
+            let target = get_offset(target, vm)?;
+            data.seek(target, whence, vm)
         }
         #[pymethod]
         fn tell(&self, vm: &VirtualMachine) -> PyResult<Offset> {
-            self.lock(vm)?.raw_tell(vm)
+            let mut data = self.lock(vm)?;
+            Ok(data.raw_tell(vm)? - data.raw_offset())
         }
         #[pymethod]
         fn truncate(
@@ -1139,23 +1179,6 @@ mod _io {
                 None => data.read_all(vm),
             }
         }
-
-        #[pymethod]
-        fn seekable(_self: PyObjectRef) -> bool {
-            true
-        }
-
-        #[pymethod]
-        fn seek(
-            instance: PyObjectRef,
-            offset: PyObjectRef,
-            how: OptionalArg,
-            vm: &VirtualMachine,
-        ) -> PyResult {
-            let raw = vm.get_attribute(instance, "raw")?;
-            let args: Vec<_> = std::iter::once(offset).chain(how.into_option()).collect();
-            vm.invoke(&vm.get_attribute(raw, "seek")?, args)
-        }
     }
 
     #[pyclass(name = "BufferedWriter", noattr)]
@@ -1194,23 +1217,6 @@ mod _io {
 
             //This should be replaced with a more appropriate chunking implementation
             vm.call_method(&raw, "write", (obj,))
-        }
-
-        #[pymethod]
-        fn seekable(_self: PyObjectRef) -> bool {
-            true
-        }
-
-        #[pymethod]
-        fn seek(
-            instance: PyObjectRef,
-            offset: PyObjectRef,
-            how: OptionalArg,
-            vm: &VirtualMachine,
-        ) -> PyResult {
-            let raw = vm.get_attribute(instance, "raw")?;
-            let args: Vec<_> = std::iter::once(offset).chain(how.into_option()).collect();
-            vm.invoke(&vm.get_attribute(raw, "seek")?, args)
         }
     }
 
